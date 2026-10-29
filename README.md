@@ -33,6 +33,9 @@ lands in `partial` with the residual risk named and explicitly
 accepted by both the successor and the approver — never silently
 `complete`.
 
+Live demo (with explainer video): https://tamtunnel.github.io/successor/
+— video at https://tamtunnel.github.io/successor/#video
+
 ## Honest limits
 
 Read these before trusting the tool. They are the product's real
