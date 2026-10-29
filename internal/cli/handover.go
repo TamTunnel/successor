@@ -12,8 +12,13 @@
 //     which part was wrong (no oracle)
 //   - execution requires approval + acceptance and a non-expired request
 //   - execution re-validates the record at run time: a forged record
-//     (approver == requester, approver without the role) is refused
-//     even if the file says otherwise
+//     (approver == requester, approver without the role, approval or
+//     acceptance present only in the record and absent from the audit
+//     log, departed successor) is refused even if the file says
+//     otherwise
+//   - acceptance likewise requires a matching approval event in the
+//     audit log, so a forged approved record with an attacker-chosen
+//     token hash cannot be accepted
 //   - a credential that cannot be re-issued lands the handover in
 //     partial with the residual risk named, never silently complete
 package cli
@@ -28,6 +33,7 @@ import (
 	"time"
 
 	"successor/internal/adapter"
+	"successor/internal/audit"
 	"successor/internal/store"
 )
 
@@ -139,8 +145,12 @@ func (c *ctx) cmdHandoverRequest(args []string) int {
 	if a.Status == "archived" {
 		return c.fail(fmt.Errorf("agent %s is archived and cannot be handed over", agentID))
 	}
-	if _, err := s.LoadPerson(to); err != nil {
+	toPerson, err := s.LoadPerson(to)
+	if err != nil {
 		return c.fail(fmt.Errorf("successor %s is not a registered person", to))
+	}
+	if toPerson.Departed {
+		return c.fail(fmt.Errorf("successor %s has departed and cannot receive a handover", to))
 	}
 	_, handovers, _, err := s.LoadAll()
 	if err != nil {
@@ -464,6 +474,23 @@ func (c *ctx) cmdHandoverAccept(args []string) int {
 	if successor != h.ToSuccessorID {
 		return refuse()
 	}
+	// The successor must still be a live, registered person: accepting
+	// as a departed or deleted successor would transfer ownership to
+	// someone who cannot hold it. Funnelled through refuse() like every
+	// other acceptance failure — no oracle.
+	if succ, err := s.LoadPerson(successor); err != nil || succ.Departed {
+		return refuse()
+	}
+	// The approval must exist in the audit log, not just in the mutable
+	// record: a hand-edited record claiming approval, with no approved
+	// event in the log, is a forgery and is refused here. This is the
+	// same cross-check execute performs for acceptance.
+	if h.ApproverID == nil {
+		return refuse()
+	}
+	if ok, err := c.auditHasEvent(s, h.ID, "handover.approved", "approver_id", *h.ApproverID); err != nil || !ok {
+		return refuse()
+	}
 	if h.AcceptanceTokenHash == nil {
 		return refuse()
 	}
@@ -545,8 +572,19 @@ func (c *ctx) cmdHandoverChecklist(args []string) int {
 	if err != nil {
 		return c.fail(err)
 	}
-	if _, err := c.knownActor(s, actor); err != nil {
+	ap, err := c.knownActor(s, actor)
+	if err != nil {
 		return c.fail(err)
+	}
+	// Sign-off is a trust-bearing attestation, not a clerical mark. The
+	// signer must hold the admin role and must not be the handover's
+	// from-owner: the person whose access is being revoked cannot attest
+	// that it was revoked, and neither can an arbitrary bystander.
+	if err := requireRole(ap, "admin"); err != nil {
+		return c.fail(err)
+	}
+	if actor == h.FromOwnerID {
+		return c.fail(fmt.Errorf("the handover's from-owner cannot sign off its own checklist items"))
 	}
 	newRef := f.opt("new-ref")
 	reason := f.opt("reason")
@@ -592,10 +630,45 @@ func (c *ctx) cmdHandoverChecklist(args []string) int {
 		fmt.Sprintf("checklist item %d marked %s by %s", idx, it.Status, actor))
 }
 
+// auditHasEvent reports whether the audit log contains an event with
+// the given action for this handover whose detail carries the expected
+// key/value pair. It loads (parses) the log but does not verify the
+// chain: a forged record is caught by the absence of the event, and a
+// tampered chain is the audit-verify command's job. A log that cannot
+// be loaded fails closed (false with an error).
+func (c *ctx) auditHasEvent(s *store.Store, handoverID, action, detailKey, detailValue string) (bool, error) {
+	log := &audit.Log{Path: s.AuditPath()}
+	events, err := log.Load()
+	if err != nil {
+		return false, err
+	}
+	for _, e := range events {
+		if e.HandoverID != handoverID || e.Action != action {
+			continue
+		}
+		if detailKey == "" {
+			return true, nil
+		}
+		if v, ok := e.Detail[detailKey]; ok && v == detailValue {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // validateExecutable re-checks every handover invariant at execution
 // time. A forged record (approver == requester, approver without the
 // role, missing acceptance) is refused even if the file claims
 // otherwise. This is what makes probe 1 pass.
+//
+// The audit log is cross-checked, not just the record: approval and
+// acceptance must each have a matching event in the log (with the
+// approver/successor the record names). A hand-edited record claiming
+// approval and acceptance, with zero such events in the log, is refused
+// here. This defeats record-only forgery; it does not defeat an
+// attacker who can also forge log entries, which is why store write
+// access remains the trust boundary and checkpoints remain the
+// off-box anchor (see README honest limits).
 func (c *ctx) validateExecutable(s *store.Store, h store.Handover) error {
 	if h.State != "accepted" {
 		return fmt.Errorf("handover %s is %s, not accepted", h.ID, h.State)
@@ -615,6 +688,30 @@ func (c *ctx) validateExecutable(s *store.Store, h store.Handover) error {
 	}
 	if h.AcceptedAt == nil {
 		return fmt.Errorf("handover %s was never accepted", h.ID)
+	}
+	// The successor must still be a live, registered person at
+	// execution time: executing to a departed successor would transfer
+	// ownership to someone who cannot hold it.
+	succ, err := s.LoadPerson(h.ToSuccessorID)
+	if err != nil {
+		return fmt.Errorf("handover %s successor is not a registered person", h.ID)
+	}
+	if succ.Departed {
+		return fmt.Errorf("handover %s successor has departed", h.ID)
+	}
+	// Approval and acceptance must be in the audit log, not just the
+	// record. (A departed approver mid-flight is not refused here:
+	// approval is a point-in-time act, and the approver was live when
+	// it was given.)
+	if ok, err := c.auditHasEvent(s, h.ID, "handover.approved", "approver_id", *h.ApproverID); err != nil {
+		return fmt.Errorf("handover %s audit log cannot be read: %w", h.ID, err)
+	} else if !ok {
+		return fmt.Errorf("handover %s has no matching approval in the audit log (record-only approval refused)", h.ID)
+	}
+	if ok, err := c.auditHasEvent(s, h.ID, "handover.accepted", "successor_id", h.ToSuccessorID); err != nil {
+		return fmt.Errorf("handover %s audit log cannot be read: %w", h.ID, err)
+	} else if !ok {
+		return fmt.Errorf("handover %s has no matching acceptance in the audit log (record-only acceptance refused)", h.ID)
 	}
 	if exp, err := time.Parse(time.RFC3339, h.ExpiresAt); err == nil && time.Now().After(exp) {
 		return fmt.Errorf("handover %s is expired", h.ID)
@@ -722,6 +819,16 @@ func (c *ctx) emitItemOutcome(s *store.Store, actor string, h store.Handover, it
 		if it.Status == "done" {
 			return c.auditEvent(s, actor, "credential.reissued", h.AgentID, h.ID, map[string]any{"ref": it.NewRef, "previous_ref": it.Ref})
 		}
+	case "verify-successor":
+		if it.Status == "done" {
+			return c.auditEvent(s, actor, "access.verified", h.AgentID, h.ID, map[string]any{"direction": "successor", "employee_id": h.ToSuccessorID})
+		}
+		return c.auditEvent(s, actor, "access.verification-waived", h.AgentID, h.ID, map[string]any{"direction": "successor", "employee_id": h.ToSuccessorID, "reason": it.Reason})
+	case "verify-leaver":
+		if it.Status == "done" {
+			return c.auditEvent(s, actor, "access.verified", h.AgentID, h.ID, map[string]any{"direction": "leaver", "employee_id": h.FromOwnerID})
+		}
+		return c.auditEvent(s, actor, "access.verification-waived", h.AgentID, h.ID, map[string]any{"direction": "leaver", "employee_id": h.FromOwnerID, "reason": it.Reason})
 	}
 	return nil
 }
@@ -822,9 +929,15 @@ func (c *ctx) cmdHandoverExecute(args []string) int {
 				if err := c.emitItemOutcome(s, actor, h, it, es); err != nil {
 					return c.fail(err)
 				}
+				// Persist per item, like the script path: if the
+				// process dies mid-loop, a retry skips the events
+				// already written instead of duplicating them.
+				h.EventsEmitted = i + 1
+				if err := s.SaveHandover(h); err != nil {
+					return c.fail(err)
+				}
 			}
 		}
-		h.EventsEmitted = len(h.Checklist)
 		if err := s.SaveHandover(h); err != nil {
 			return c.fail(err)
 		}
@@ -851,9 +964,9 @@ func (c *ctx) cmdHandoverExecute(args []string) int {
 			case "reissue":
 				res = hooks.Reissue(it.Ref, h.ToSuccessorID)
 			case "verify-successor":
-				res = hooks.Verify(h.ToSuccessorID, h.AgentID)
+				res = hooks.Verify(it.Kind, h.ToSuccessorID, h.AgentID)
 			case "verify-leaver":
-				res = hooks.Verify(h.FromOwnerID, h.AgentID)
+				res = hooks.Verify(it.Kind, h.FromOwnerID, h.AgentID)
 			}
 			if res.Flagged {
 				_ = c.auditEvent(s, actor, "adapter.output-flagged", h.AgentID, h.ID, map[string]any{"kind": it.Kind, "ref": it.Ref, "pattern": res.FlagPattern})

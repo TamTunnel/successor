@@ -229,7 +229,9 @@ func requireRole(p store.Person, role string) error {
 }
 
 // checkClean refuses free-text input containing secret-shaped material.
-// The error never echoes the input.
+// The error never echoes the input. It uses the strict scan: a bare
+// hash-shaped token never legitimately appears in a name, reason, or
+// reference supplied by a human.
 func checkClean(s string) error {
 	if s == "" {
 		return nil
@@ -237,7 +239,7 @@ func checkClean(s string) error {
 	if strings.Contains(s, "\n") || strings.Contains(s, "\r") {
 		return fmt.Errorf("input must be a single line")
 	}
-	if name := scan.Match(s); name != "" {
+	if name := scan.MatchStrict(s); name != "" {
 		return fmt.Errorf("input refused: secret-shaped material detected (%s)", name)
 	}
 	return nil
@@ -326,16 +328,22 @@ func (c *ctx) cmdInit(args []string) int {
 	if err != nil {
 		return c.fail(err)
 	}
-	if _, err := os.Stat(filepath.Join(c.storeDir, "meta.json")); err == nil {
-		return c.fail(fmt.Errorf("store %q already initialized", c.storeDir))
-	}
 	for _, d := range []string{"agents", "handovers", "persons", "keys"} {
 		if err := os.MkdirAll(filepath.Join(c.storeDir, d), 0755); err != nil {
 			return c.fail(err)
 		}
 	}
-	if _, err := os.OpenFile(filepath.Join(c.storeDir, ".lock"), os.O_CREATE|os.O_RDWR, 0600); err != nil {
+	// Take the store lock BEFORE the already-initialized check: two
+	// concurrent inits must serialize, or both could pass the check
+	// and clobber each other's keys. The lock is held for the whole
+	// init (meta, keys, genesis, admin seed).
+	s := &store.Store{Dir: c.storeDir}
+	if err := s.Lock(); err != nil {
 		return c.fail(err)
+	}
+	defer s.Unlock()
+	if _, err := os.Stat(filepath.Join(c.storeDir, "meta.json")); err == nil {
+		return c.fail(fmt.Errorf("store %q already initialized", c.storeDir))
 	}
 	// Ed25519 audit keypair. The private key lives on-box at 0600: the
 	// documented v1 weakness (see README honest limits). Checkpoints
@@ -351,15 +359,10 @@ func (c *ctx) cmdInit(args []string) int {
 	if err := os.WriteFile(filepath.Join(c.storeDir, "audit.pub"), []byte(hex.EncodeToString(pub)+"\n"), 0644); err != nil {
 		return c.fail(err)
 	}
-	s := &store.Store{Dir: c.storeDir}
 	s.Meta = store.Meta{Version: 1, CreatedAt: store.NowUTC(), KeyID: keyID, Generation: 1}
 	if err := s.SaveMeta(); err != nil {
 		return c.fail(err)
 	}
-	if err := s.Lock(); err != nil {
-		return c.fail(err)
-	}
-	defer s.Unlock()
 	log := &audit.Log{Path: s.AuditPath()}
 	if _, err := log.Append(audit.Event{Ts: store.NowUTC(), ActorID: "system", Action: "audit.genesis", Detail: map[string]any{"store_version": 1}}); err != nil {
 		return c.fail(err)
@@ -541,6 +544,24 @@ func (c *ctx) cmdPersonDepart(args []string) int {
 	if err != nil {
 		return c.fail(err)
 	}
+	// Departing the last live admin would lock every admin act out of
+	// the store. Refuse, so lockout requires a deliberate sequence
+	// (add a successor admin first), not one command.
+	if p.HasRole("admin") && !p.Departed {
+		_, _, persons, err := s.LoadAll()
+		if err != nil {
+			return c.fail(err)
+		}
+		liveAdmins := 0
+		for _, q := range persons {
+			if q.HasRole("admin") && !q.Departed {
+				liveAdmins++
+			}
+		}
+		if liveAdmins <= 1 {
+			return c.fail(fmt.Errorf("cannot depart %s: the last live admin (add another admin first)", id))
+		}
+	}
 	p.Departed = true
 	if err := s.SavePerson(p); err != nil {
 		return c.fail(err)
@@ -646,8 +667,12 @@ func (c *ctx) cmdAgentRegister(args []string) int {
 	if err := requireRole(ap, "admin"); err != nil {
 		return c.fail(err)
 	}
-	if _, err := s.LoadPerson(owner); err != nil {
+	ownerPerson, err := s.LoadPerson(owner)
+	if err != nil {
 		return c.fail(fmt.Errorf("owner %s is not a registered person", owner))
+	}
+	if ownerPerson.Departed {
+		return c.fail(fmt.Errorf("owner %s has departed and cannot own an agent", owner))
 	}
 	id, err := store.GenerateULID()
 	if err != nil {

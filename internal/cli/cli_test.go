@@ -848,7 +848,8 @@ func TestScriptAdapter(t *testing.T) {
 	writeHook("disable-schedule", "exit 0")
 	writeHook("revoke", "exit 0")
 	writeHook("reissue", `echo "vault:new-ref-for-$1"`)
-	writeHook("verify", "exit 0")
+	writeHook("verify-successor", "exit 0")
+	writeHook("verify-leaver", "exit 0")
 
 	hoID, _ := toAccepted(t, dir, agentID)
 	out := mustCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009", "--adapter", "script", "--hook-dir", hooks)
@@ -1049,6 +1050,375 @@ func TestJSONOutput(t *testing.T) {
 	l := jsonCLI(t, dir, "agent", "list")
 	if _, ok := l["agents"]; !ok {
 		t.Fatalf("agent list JSON missing agents key: %v", l)
+	}
+}
+
+func TestForgedHandoverAuditCrossCheck(t *testing.T) {
+	// Fix 1 (judge J1): approval and acceptance must exist in the
+	// audit log, not just in the mutable record. A forged record with
+	// a legitimate approver but zero audit events is refused.
+	dir, agentID := fleet(t)
+	m := jsonCLI(t, dir, "handover", "request", "--actor", "E-1009",
+		"--agent", agentID, "--to", "E-1002")
+	hoID := m["id"].(string)
+	now := time.Now().UTC().Format(time.RFC3339)
+	editHandover(t, dir, hoID, func(h *store.Handover) {
+		h.State = "accepted"
+		h.ApproverID = strptr("E-1010") // legitimate approver role
+		h.ApprovedAt = &now
+		h.AcceptedAt = &now
+	})
+	if errBuf := failCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009"); !strings.Contains(errBuf, "audit log") {
+		t.Fatalf("forged accepted record not refused on audit grounds: %s", errBuf)
+	}
+	if got := handoverState(t, dir, hoID); got != "accepted" {
+		t.Fatalf("state changed to %s after refused execute", got)
+	}
+
+	// Forged approval with an attacker-chosen token: accept must
+	// refuse, because no approved event exists in the log.
+	m2 := jsonCLI(t, dir, "agent", "register", "--actor", "E-1009",
+		"--name", "forge-bot", "--owner", "E-1001", "--runtime", "cron")
+	m3 := jsonCLI(t, dir, "handover", "request", "--actor", "E-1009",
+		"--agent", m2["id"].(string), "--to", "E-1002")
+	ho2 := m3["id"].(string)
+	attackerToken := "00000000000000000000000000000000"
+	sum := sha256.Sum256([]byte(attackerToken))
+	hash := hex.EncodeToString(sum[:])
+	later := time.Now().UTC().Add(72 * time.Hour).Format(time.RFC3339)
+	editHandover(t, dir, ho2, func(h *store.Handover) {
+		h.State = "approved"
+		h.ApproverID = strptr("E-1010")
+		h.ApprovedAt = &now
+		h.AcceptanceTokenHash = &hash
+		h.TokenExpiresAt = &later
+	})
+	if errBuf := failCLI(t, dir, "handover", "accept", ho2, "--actor", "E-1002", "--successor", "E-1002", "--token", attackerToken); !strings.Contains(errBuf, "acceptance refused") {
+		t.Fatalf("forged approval accepted: %s", errBuf)
+	}
+}
+
+func TestDepartedSuccessorFamily(t *testing.T) {
+	// Fix 2 (review F1, judge J2): a departed or deleted person must
+	// never receive, accept, or end up owning a handover.
+	t.Run("request to departed", func(t *testing.T) {
+		dir, agentID := fleet(t)
+		mustCLI(t, dir, "person", "depart", "E-1002", "--actor", "E-1009")
+		if errBuf := failCLI(t, dir, "handover", "request", "--actor", "E-1009", "--agent", agentID, "--to", "E-1002"); !strings.Contains(errBuf, "departed") {
+			t.Fatalf("request to departed successor not refused: %s", errBuf)
+		}
+	})
+	t.Run("accept as departed", func(t *testing.T) {
+		dir, agentID := fleet(t)
+		m := jsonCLI(t, dir, "handover", "request", "--actor", "E-1009", "--agent", agentID, "--to", "E-1002")
+		hoID := m["id"].(string)
+		ap := jsonCLI(t, dir, "handover", "approve", hoID, "--actor", "E-1010", "--approver", "E-1010")
+		mustCLI(t, dir, "person", "depart", "E-1002", "--actor", "E-1009")
+		if errBuf := failCLI(t, dir, "handover", "accept", hoID, "--actor", "E-1002", "--successor", "E-1002", "--token", ap["acceptance_token"].(string)); !strings.Contains(errBuf, "acceptance refused") {
+			t.Fatalf("departed successor accept not refused: %s", errBuf)
+		}
+	})
+	t.Run("accept as deleted", func(t *testing.T) {
+		dir, agentID := fleet(t)
+		m := jsonCLI(t, dir, "handover", "request", "--actor", "E-1009", "--agent", agentID, "--to", "E-1002")
+		hoID := m["id"].(string)
+		ap := jsonCLI(t, dir, "handover", "approve", hoID, "--actor", "E-1010", "--approver", "E-1010")
+		if err := os.Remove(filepath.Join(dir, "persons", "E-1002.json")); err != nil {
+			t.Fatal(err)
+		}
+		if errBuf := failCLI(t, dir, "handover", "accept", hoID, "--actor", "E-1002", "--successor", "E-1002", "--token", ap["acceptance_token"].(string)); !strings.Contains(errBuf, "acceptance refused") {
+			t.Fatalf("deleted successor accept not refused: %s", errBuf)
+		}
+	})
+	t.Run("execute to departed", func(t *testing.T) {
+		dir, agentID := fleet(t)
+		hoID, _ := toAccepted(t, dir, agentID)
+		mustCLI(t, dir, "person", "depart", "E-1002", "--actor", "E-1009")
+		for _, it := range checklist(t, dir, hoID) {
+			if it.Kind == "reissue" {
+				signItem(t, dir, hoID, it.Index, true, "--new-ref", "iam:new")
+			} else {
+				signItem(t, dir, hoID, it.Index, true)
+			}
+		}
+		if errBuf := failCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009"); !strings.Contains(errBuf, "departed") {
+			t.Fatalf("execute to departed successor not refused: %s", errBuf)
+		}
+		if a := showAgentJSON(t, dir, agentID); a["owner_id"] != "E-1001" {
+			t.Fatalf("owner changed to %v after refused execute", a["owner_id"])
+		}
+	})
+	t.Run("register with departed owner", func(t *testing.T) {
+		dir, _ := fleet(t)
+		mustCLI(t, dir, "person", "depart", "E-1001", "--actor", "E-1009")
+		if errBuf := failCLI(t, dir, "agent", "register", "--actor", "E-1009",
+			"--name", "orphan-bot", "--owner", "E-1001", "--runtime", "cron"); !strings.Contains(errBuf, "departed") {
+			t.Fatalf("register with departed owner not refused: %s", errBuf)
+		}
+	})
+}
+
+func TestChecklistSignoffRoleGate(t *testing.T) {
+	// Fix 3 (review F2, judge J3): sign-off requires the admin role
+	// and a signer other than the handover's from-owner.
+	dir, agentID := fleet(t)
+	hoID, _ := toAccepted(t, dir, agentID)
+	if errBuf := failCLI(t, dir, "handover", "checklist", hoID, "--item", "1", "--done", "--actor", "E-1001"); !strings.Contains(errBuf, "admin") {
+		t.Fatalf("leaver self-sign-off not refused on role grounds: %s", errBuf)
+	}
+	if errBuf := failCLI(t, dir, "handover", "checklist", hoID, "--item", "1", "--done", "--actor", "E-1002"); !strings.Contains(errBuf, "admin") {
+		t.Fatalf("non-admin sign-off not refused: %s", errBuf)
+	}
+	// An admin who IS the from-owner is still refused.
+	m2 := jsonCLI(t, dir, "agent", "register", "--actor", "E-1009",
+		"--name", "admin-owned-bot", "--owner", "E-1009", "--runtime", "cron")
+	ho2, _ := toAccepted(t, dir, m2["id"].(string))
+	if errBuf := failCLI(t, dir, "handover", "checklist", ho2, "--item", "1", "--done", "--actor", "E-1009"); !strings.Contains(errBuf, "from-owner") {
+		t.Fatalf("admin from-owner sign-off not refused: %s", errBuf)
+	}
+	// The admin who is not the from-owner still signs fine.
+	mustCLI(t, dir, "handover", "checklist", hoID, "--item", "1", "--done", "--actor", "E-1009")
+}
+
+func TestVerifyDirection(t *testing.T) {
+	// Fix 4 (review F3, judge J4): verify-successor and verify-leaver
+	// are distinct scripts. A presence-check hook must fail the leaver
+	// check while the leaver still holds access, and pass once the
+	// leaver is gone.
+	dir, agentID := fleet(t)
+	hooks := filepath.Join(t.TempDir(), "hooks")
+	if err := os.MkdirAll(hooks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	table := filepath.Join(t.TempDir(), "access-table")
+	if err := os.WriteFile(table, []byte("E-1002\nE-1001\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	writeHook := func(name, body string) {
+		p := filepath.Join(hooks, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHook("disable-schedule", "exit 0")
+	writeHook("revoke", "exit 0")
+	writeHook("reissue", `echo "vault:dir-new-$1"`)
+	// Presence check: exit 0 iff the employee is in the table.
+	writeHook("verify-successor", fmt.Sprintf(`grep -qx "$1" %s`, table))
+	// Absence check: exit 0 iff the employee is NOT in the table.
+	writeHook("verify-leaver", fmt.Sprintf(`! grep -qx "$1" %s`, table))
+
+	hoID, _ := toAccepted(t, dir, agentID)
+	if errBuf := failCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009", "--adapter", "script", "--hook-dir", hooks); !strings.Contains(errBuf, "verify-leaver") {
+		t.Fatalf("execute with leaver still holding access did not fail at verify-leaver: %s", errBuf)
+	}
+	if got := handoverState(t, dir, hoID); got != "accepted" {
+		t.Fatalf("state = %s after failed verify, want accepted", got)
+	}
+	if a := showAgentJSON(t, dir, agentID); a["owner_id"] != "E-1001" {
+		t.Fatalf("owner changed to %v despite failed verify", a["owner_id"])
+	}
+	// Leaver access gone: the retry resumes and completes.
+	if err := os.WriteFile(table, []byte("E-1002\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	out := mustCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009", "--adapter", "script", "--hook-dir", hooks)
+	if !strings.Contains(out, "executed") {
+		t.Fatalf("resumed execute did not report executed: %s", out)
+	}
+}
+
+func TestReportStaleFailedExecution(t *testing.T) {
+	// Fix 5 (review F4): an accepted handover with a recorded failed
+	// execution must show up in the stale report.
+	dir, _ := fleet(t)
+	hooks := filepath.Join(t.TempDir(), "hooks")
+	if err := os.MkdirAll(hooks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeHook := func(name, body string) {
+		p := filepath.Join(hooks, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHook("disable-schedule", "exit 0")
+	writeHook("revoke", "exit 1")
+	writeHook("reissue", `echo "vault:stale-new"`)
+	writeHook("verify-successor", "exit 0")
+	writeHook("verify-leaver", "exit 0")
+	m := jsonCLI(t, dir, "agent", "register", "--actor", "E-1009",
+		"--name", "stale-bot", "--owner", "E-1001", "--runtime", "cron",
+		"--credential-ref", "iam:stale-key")
+	hoID, _ := toAccepted(t, dir, m["id"].(string))
+	if errBuf := failCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009", "--adapter", "script", "--hook-dir", hooks); !strings.Contains(errBuf, "stopped") {
+		t.Fatalf("failing hook did not stop execution: %s", errBuf)
+	}
+	stale := mustCLI(t, dir, "report", "stale")
+	if !strings.Contains(stale, hoID) || !strings.Contains(stale, "failed execution") {
+		t.Fatalf("stale report missing stuck handover:\n%s", stale)
+	}
+}
+
+func TestSecretShapesWidened(t *testing.T) {
+	// Fix 6 (judge J5): AWS secret keys, JWTs, generic key assignments,
+	// and bare hex tokens are refused in free text, and a reissue hook
+	// printing a secret has its output discarded, never persisted.
+	dir, agentID := fleet(t)
+	awsKey := strings.Repeat("A", 20) + strings.Repeat("B", 20)
+	jwt := "eyJ" + strings.Repeat("h", 10) + "." + strings.Repeat("p", 10) + "." + strings.Repeat("s", 10)
+	assign := strings.Join([]string{"api", "_key", ": "}, "") + strings.Repeat("k", 16)
+	hex64 := strings.Repeat("a", 64)
+	for _, shape := range []string{awsKey, jwt, assign, hex64} {
+		if errBuf := failCLI(t, dir, "handover", "request", "--actor", "E-1009",
+			"--agent", agentID, "--to", "E-1002", "--reason", shape); !strings.Contains(errBuf, "secret-shaped") {
+			t.Fatalf("secret-shaped reason not refused: %s", errBuf)
+		}
+	}
+	// Reissue hook printing secret material is flagged, discarded,
+	// and never stored.
+	hooks := filepath.Join(t.TempDir(), "hooks")
+	if err := os.MkdirAll(hooks, 0755); err != nil {
+		t.Fatal(err)
+	}
+	writeHook := func(name, body string) {
+		p := filepath.Join(hooks, name)
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeHook("disable-schedule", "exit 0")
+	writeHook("revoke", "exit 0")
+	writeHook("reissue", "echo "+awsKey)
+	writeHook("verify-successor", "exit 0")
+	writeHook("verify-leaver", "exit 0")
+	m := jsonCLI(t, dir, "agent", "register", "--actor", "E-1009",
+		"--name", "secret-bot", "--owner", "E-1001", "--runtime", "cron",
+		"--credential-ref", "iam:secret-key")
+	hoID, _ := toAccepted(t, dir, m["id"].(string))
+	if errBuf := failCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009", "--adapter", "script", "--hook-dir", hooks); !strings.Contains(errBuf, "flagged") {
+		t.Fatalf("secret-printing reissue hook not flagged: %s", errBuf)
+	}
+	if !contains(auditActions(t, dir), "adapter.output-flagged") {
+		t.Fatal("flagged reissue output was not audited")
+	}
+	err := filepath.Walk(dir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil || info.IsDir() || info.Name() == ".lock" {
+			return err
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(b), awsKey) {
+			return fmt.Errorf("hook-printed secret persisted in %s", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAuditTailTruncationAndLogSwap(t *testing.T) {
+	// Fix 9 (review F5, judge J8): clean tail truncation and a swapped
+	// log both pass bare verification (valid prefix chains) and fail
+	// only against a prior checkpoint. Both behaviors are pinned.
+	dir, agentID := fleet(t)
+	hoID, _ := toAccepted(t, dir, agentID)
+	_ = hoID
+	cpPath := filepath.Join(t.TempDir(), "checkpoint.json")
+	mustCLI(t, dir, "audit", "checkpoint", "--actor", "E-1009", "--out", cpPath)
+	path := filepath.Join(dir, "audit.jsonl")
+	orig, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(orig), "\n"), "\n")
+	// Drop the last TWO lines: the checkpoint event itself plus the
+	// event it pins. Dropping only the checkpoint event would leave
+	// the pinned event intact and the checkpoint would still pass.
+	truncated := strings.Join(lines[:len(lines)-2], "\n") + "\n"
+	if err := os.WriteFile(path, []byte(truncated), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Bare verification still passes: a valid prefix chain.
+	mustCLI(t, dir, "audit", "verify")
+	// The prior checkpoint catches it.
+	if errBuf := failCLI(t, dir, "audit", "verify", "--checkpoint", cpPath); !strings.Contains(errBuf, "checkpoint") {
+		t.Fatalf("truncated log passed the checkpoint: %s", errBuf)
+	}
+	// Restore, then swap in another store's valid log.
+	if err := os.WriteFile(path, orig, 0600); err != nil {
+		t.Fatal(err)
+	}
+	mustCLI(t, dir, "audit", "verify", "--checkpoint", cpPath)
+	other := t.TempDir()
+	mustCLI(t, other, "init", "--admin", "E-2009", "--admin-name", "Other Admin")
+	otherLog, err := os.ReadFile(filepath.Join(other, "audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, otherLog, 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Another store's internally valid chain passes bare verification:
+	// genesis carries no store identity.
+	mustCLI(t, dir, "audit", "verify")
+	if errBuf := failCLI(t, dir, "audit", "verify", "--checkpoint", cpPath); !strings.Contains(errBuf, "checkpoint") {
+		t.Fatalf("swapped log passed the checkpoint: %s", errBuf)
+	}
+	_ = agentID
+}
+
+func TestVerifyEventsEmitted(t *testing.T) {
+	// Fix 10 (judge minor): verify steps emit distinct audit events,
+	// so the trail shows verify ran, in both directions.
+	dir, agentID := fleet(t)
+	hoID, _ := toAccepted(t, dir, agentID)
+	for _, it := range checklist(t, dir, hoID) {
+		if it.Kind == "reissue" {
+			signItem(t, dir, hoID, it.Index, true, "--new-ref", "iam:new")
+		} else {
+			signItem(t, dir, hoID, it.Index, true)
+		}
+	}
+	mustCLI(t, dir, "handover", "execute", hoID, "--actor", "E-1009")
+	verified := 0
+	for _, a := range auditActions(t, dir) {
+		if a == "access.verified" {
+			verified++
+		}
+	}
+	if verified != 2 {
+		t.Fatalf("access.verified events = %d, want 2 (successor + leaver)", verified)
+	}
+	// Waived verifies emit the waived variant, even when execute stops
+	// at the risk gate.
+	m2 := jsonCLI(t, dir, "agent", "register", "--actor", "E-1009",
+		"--name", "waive-bot", "--owner", "E-1001", "--runtime", "cron")
+	ho2, _ := toAccepted(t, dir, m2["id"].(string))
+	waiveByKind(t, dir, ho2, "verify-successor", "", "no verification path in this test")
+	waiveByKind(t, dir, ho2, "verify-leaver", "", "no verification path in this test")
+	if errBuf := failCLI(t, dir, "handover", "execute", ho2, "--actor", "E-1009"); !strings.Contains(errBuf, "residual risks") {
+		t.Fatalf("waived verifies did not block on residual risks: %s", errBuf)
+	}
+	if !contains(auditActions(t, dir), "access.verification-waived") {
+		t.Fatal("waived verify emitted no access.verification-waived event")
+	}
+}
+
+func TestDepartLastAdminRefused(t *testing.T) {
+	// Fix 13: departing the last live admin would lock the store out
+	// of every admin act, so it is refused until another admin exists.
+	dir, _ := fleet(t)
+	if errBuf := failCLI(t, dir, "person", "depart", "E-1009", "--actor", "E-1009"); !strings.Contains(errBuf, "last live admin") {
+		t.Fatalf("departing the last admin not refused: %s", errBuf)
+	}
+	mustCLI(t, dir, "person", "add", "--actor", "E-1009", "--id", "E-1011", "--name", "Second Admin", "--admin")
+	out := mustCLI(t, dir, "person", "depart", "E-1009", "--actor", "E-1011")
+	if !strings.Contains(out, "marked departed") {
+		t.Fatalf("depart after adding a second admin failed: %s", out)
 	}
 }
 

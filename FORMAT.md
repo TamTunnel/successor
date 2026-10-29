@@ -195,10 +195,18 @@ V1 extensions in the same chain: `audit.genesis`, `person.added`,
 `person.departed`, `agent.quarantined`, `agent.unquarantined`,
 `handover.checklist-signed`, `handover.execute-refused`,
 `handover.accept-refused` (generic detail, no oracle),
-`audit.checkpoint` (seq/hash/key_id/generation — never the signature),
-`audit.key-rotated` (old/new key IDs), `audit.verified` (pass/fail of
-a verification run, only when `--actor` is given),
-`adapter.output-flagged` (kind/ref/pattern name only).
+`access.verified` (direction/employee_id — one per verify step, so the
+trail shows verify ran), `access.verification-waived`
+(direction/employee_id/reason), `audit.checkpoint` (seq/hash/key_id/
+generation — never the signature), `audit.key-rotated` (old/new key
+IDs), `audit.verified` (pass/fail of a verification run, only when
+`--actor` is given), `adapter.output-flagged` (kind/ref/pattern name
+only).
+
+Two deliberate absences: token expiry alone emits no event — the
+generic `handover.accept-refused` is the only trace, so expiry stays
+indistinguishable from a wrong token (no oracle). And `handover.expired`
+covers handover expiry (the 7-day TTL) only, not token expiry.
 
 ### Checkpoints
 
@@ -222,6 +230,12 @@ off-box:
   lives off-box.
 - `audit export` is a byte copy of the log, not a re-render: the
   exported file hashes identically to the on-disk log.
+- Bare verification proves the chain is internally consistent, nothing
+  more. Clean tail truncation (dropping trailing lines leaves a valid
+  prefix chain) and swapping in another store's valid log (genesis
+  carries no store identity) both pass bare verification; only a prior
+  checkpoint catches them, because the checkpoint pins one (seq, hash)
+  the truncated or swapped log no longer passes through.
 - Key rotation (`audit rotate-key`, admin-only) generates a new
   keypair, archives the old public key to `keys/<old-key-id>.pub`,
   updates meta, and bumps generation. Checkpoints signed under the

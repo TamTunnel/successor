@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"successor/internal/audit"
 	"successor/internal/store"
 )
 
@@ -101,6 +102,22 @@ func (c *ctx) cmdReportStale(args []string) int {
 	if err != nil {
 		return c.fail(err)
 	}
+	// Accepted handovers with a recorded failed execution are stuck:
+	// execution stopped (e.g. a hook failed) and the handover never
+	// completed, but nothing else in the stale report names them.
+	// The audit log is the record of failures; a log that cannot be
+	// read fails the report rather than silently omitting them.
+	failedExecution := map[string]bool{}
+	log := &audit.Log{Path: s.AuditPath()}
+	if events, err := log.Load(); err != nil {
+		return c.fail(err)
+	} else {
+		for _, e := range events {
+			if e.Action == "handover.execute-refused" && e.HandoverID != "" {
+				failedExecution[e.HandoverID] = true
+			}
+		}
+	}
 	var lines []string
 	var items []map[string]any
 	for _, a := range agents {
@@ -118,6 +135,10 @@ func (c *ctx) cmdReportStale(args []string) int {
 			lines = append(lines, fmt.Sprintf("handover %s for agent %s expired", h.ID, h.AgentID))
 			items = append(items, map[string]any{"type": "handover-expired", "handover_id": h.ID, "agent_id": h.AgentID})
 		case "accepted":
+			if failedExecution[h.ID] {
+				lines = append(lines, fmt.Sprintf("handover %s for agent %s has a recorded failed execution and is still accepted (fix the failure and re-run execute)", h.ID, h.AgentID))
+				items = append(items, map[string]any{"type": "handover-failed-execution", "handover_id": h.ID, "agent_id": h.AgentID})
+			}
 			if len(h.ResidualRisks) > 0 {
 				missing := []string{}
 				hasS, hasA := false, false

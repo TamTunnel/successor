@@ -22,9 +22,11 @@ Sign-off rules (`handover checklist <id> --item <n> ...`):
   revoke/schedule/verify items, becomes part of the residual risk).
 - Signing a re-issue `--done` requires `--new-ref`: the replacement
   reference. `--new-ref` is refused on any other item kind.
-- Any registered, non-departed person may sign; the signer and time
-  are recorded per item. Sign-off is a human attestation, and the
-  audit trail says who attested what.
+- Only an admin who is not the handover's from-owner may sign. The
+  person whose access is being revoked cannot attest that it was
+  revoked, and neither can an arbitrary bystander: sign-off is a
+  trust-bearing attestation, and the audit trail says who attested
+  what.
 - Execute refuses while any item is still pending, and refuses a
   re-issue marked done without a new reference.
 - Outcome semantics at execute time:
@@ -57,7 +59,8 @@ must be executable by the invoking user.
 | `disable-schedule` | `<schedule-ref>` (or agent ID when no ref) | schedule disabled | cannot disable here | step failed, execution stops |
 | `revoke` | `<credential-ref>` | grant revoked | cannot revoke here | step failed, execution stops |
 | `reissue` | `<credential-ref> <successor-emp-id>` | print the new reference, exactly one line | cannot re-issue here | step failed, execution stops |
-| `verify` | `<emp-id> <agent-id>` | the checked access state holds | cannot verify here | step failed, execution stops |
+| `verify-successor` | `<emp-id> <agent-id>` | the successor's access holds | cannot verify here | step failed, execution stops |
+| `verify-leaver` | `<emp-id> <agent-id>` | the leaver's access is gone | cannot verify here | step failed, execution stops |
 
 Contract details:
 
@@ -71,12 +74,24 @@ Contract details:
   else (empty, multiple lines, a non-reference) fails the step. The
   reference is validated as a reference: single line, no whitespace,
   not secret-shaped.
-- **Verify semantics depend on the item.** For `verify-successor`,
-  exit 0 means the successor's access holds. For `verify-leaver`,
-  exit 0 means the leaver's access is gone. The hook receives the
-  employee ID being checked, so one script can implement both cases.
-- **Timeout.** Each hook is killed after 60 seconds; a timeout fails
-  the step.
+- **Verify semantics are fixed per script, not per item.** For
+  `verify-successor`, exit 0 means the successor's access holds. For
+  `verify-leaver`, exit 0 means the leaver's access is gone. The two
+  checks are separate scripts precisely so a hook can never confuse
+  them: an earlier single-`verify` design passed only the employee ID,
+  which made exit 0 ambiguous, and a truthful presence-check hook
+  (exit 0 iff the employee holds access) was read inverted for the
+  leaver — a handover completed while leaver access was intact. A
+  hook directory with only the old single `verify` script fails
+  loudly (missing executable) instead of silently misbehaving.
+- **Timeout.** Each hook is killed after 60 seconds, and the timeout
+  bounds wall-clock execution time: hook output goes to temp files,
+  not pipes, so a hook that spawns descendants holding stdout open
+  cannot stall execution past the timeout, and the whole process
+  group is killed on timeout. A hook that daemonizes (setsid) escapes
+  the group kill but still cannot stall execution, because nothing
+  waits on its output handles. Captured output is capped at 1 MiB per
+  stream; beyond that the step fails.
 - **Output is never logged verbatim.** Stdout and stderr are scanned
   for secret-shaped material. If any is found, the step fails, the
   output is discarded, and an `adapter.output-flagged` event records
@@ -89,7 +104,24 @@ Contract details:
 - **Hooks run as the invoking user.** They inherit that user's
   permissions and nothing else. Successor adds no privilege, no
   sandbox, and no credential handling around them — that boundary is
-  the hook author's responsibility.
+  the hook author's responsibility. This has one sharp consequence
+  worth stating plainly: a hook can read anything the invoking user
+  can read, including the store's audit signing key (0600, same UID).
+  A malicious hook that copies the key can sign checkpoints for
+  rewritten history after the last checkpoint exported before the
+  copy — previously exported checkpoints still pin history up to
+  their sequence, but nothing after. Treat hooks as trusted code:
+  review them before installing, and keep checkpoint exports current.
+  Running hooks as a separate user, or moving the key out of hook
+  reach, is planned for v1.1.
+- **Idempotency for retries.** On a risk-acceptance execute, hooks run
+  before both risk acceptances are collected (rotation-required is
+  only learned by trying). If the approver never accepts, grants
+  changed while ownership did not transfer. Hooks must therefore be
+  idempotent: re-running execute after a partial or failed run must
+  be safe, and a hook that cannot run twice safely must refuse the
+  second run cleanly (exit 3, unsupported, is the honest answer for
+  "already done elsewhere").
 
 Minimal example (fake refs, no real systems):
 
