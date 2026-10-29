@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Successor — governed handover for employee-built agents</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:760px;margin:0 auto;padding:32px 20px;line-height:1.6;color:#1a1d23;background:#fff}
+  h1{font-size:2em;margin-bottom:.2em} h2{margin-top:2em;border-top:1px solid #e5e7eb;padding-top:1em}
+  code{background:#f3f4f6;padding:2px 5px;border-radius:4px}
+  pre{background:#0b0e14;color:#e6ebf4;padding:16px;border-radius:8px;overflow-x:auto}
+  pre code{background:none;padding:0}
+  video{width:100%;border-radius:8px;background:#0b0e14}
+  .tag{color:#5b6472} a{color:#0969da}
+  .limits li{margin-bottom:.4em}
+</style>
+</head>
+<body>
+<h1>Successor</h1>
+<p class="tag">When the person who built the agent leaves, the agent doesn't. Successor governs the handover — and proves it happened.</p>
+
+<h2>The problem</h2>
+<p>When an employee who built internal agents leaves, those agents keep running — on schedules, with credentials, under an owner who is gone. In most orgs that handover is a ticket, a chat message, and hope. There is no record of who approved it, no proof the credentials were rotated, and no way to tell afterward whether the leaver can still get in.</p>
+
+<h2>The solution, in plain terms</h2>
+<p>Successor is a small command-line tool, one static Go binary with no runtime to install. An admin registers each agent — what it is, who owns it, where its config and runbook live, and <em>references</em> to its credentials (never the credentials themselves). When the owner leaves, an admin requests a handover to a named successor. A different person, holding the approver role, approves it. The successor accepts with a one-time token delivered outside the tool. Then the credentials are revoked and re-issued under the successor (by a human checklist or by scripts), the schedule is disabled, and both the successor's and the leaver's access are verified. Every step lands in a hash-chained audit log, and signed checkpoints can be stored off the machine so that even a full rewrite of the log is detectable.</p>
+<p>The one rule the whole tool is built around: <strong>Successor never sees, stores, logs, or transmits secret material.</strong> It records references and outcomes only. If a credential cannot be re-issued, the handover lands in <code>partial</code> with the residual risk named and explicitly accepted by both the successor and the approver — never silently <code>complete</code>.</p>
+
+<h2 id="video">Demo video</h2>
+<p>A real end-to-end handover, recorded from a live run against a scratch store (clearly fake example data; the one-time token is redacted — it was single-use and already consumed).</p>
+<video controls preload="metadata" src="successor-explainer.mp4">
+  Your browser does not support the video tag. <a href="successor-explainer.mp4">Download the video</a>.
+</video>
+
+<h2>Quick start</h2>
+<pre><code>go build -o dist/successor .
+
+# 1. Create the store (one Ed25519 audit keypair, on-box at 0600).
+successor --store ~/.successor init --admin E-1009 --admin-name "Admin Example"
+
+# 2. Register people and the agent (credential REFERENCES only).
+successor --store ~/.successor person add --actor E-1009 --id E-1001 --name "Alex Example"
+successor --store ~/.successor person add --actor E-1009 --id E-1002 --name "Sam Sample"
+successor --store ~/.successor person add --actor E-1009 --id E-1010 --name "Approver Example" --approver
+successor --store ~/.successor agent register --actor E-1009 \
+  --name deploy-bot --owner E-1001 --runtime cron \
+  --credential-ref "iam:prod-key-1" --credential-ref "vendor:legacy-key" \
+  --schedule-ref "cron:nightly-deploy"
+
+# 3. Request, approve, accept (token delivered through the org's secure channel).
+successor --store ~/.successor handover request --actor E-1009 \
+  --agent &lt;agent-id&gt; --to E-1002 --reason "E-1001 departing"
+successor --store ~/.successor handover approve &lt;handover-id&gt; --actor E-1010 --approver E-1010
+successor --store ~/.successor handover accept &lt;handover-id&gt; \
+  --actor E-1002 --successor E-1002 --token &lt;one-time-token&gt;
+
+# 4. Work the checklist, then execute. Prove the log, export a checkpoint.
+successor --store ~/.successor handover checklist &lt;handover-id&gt; --item 1 --done --actor E-1009
+successor --store ~/.successor handover execute &lt;handover-id&gt; --actor E-1009
+successor --store ~/.successor audit verify
+successor --store ~/.successor audit checkpoint --actor E-1009 --out /secure/off-box/cp.json</code></pre>
+
+<h2>Honest limits</h2>
+<ul class="limits">
+  <li>Successor cannot hand over agents it does not know about. Inventory completeness is the org's responsibility.</li>
+  <li>Successor cannot un-know a secret the leaver copied. Rotation is the only cure; where rotation is impossible, the risk is named, not hidden.</li>
+  <li>Without an adapter that can actually revoke, re-issue, and disable, a handover is a governed record, not enforcement.</li>
+  <li>The audit trail detects tampering against an independently held checkpoint. Without exported checkpoints, a full-store rewrite is undetectable. Export checkpoints off-box.</li>
+  <li>Actor identity is asserted, not authenticated, in v1. Do not deploy on a box where untrusted users can invoke it as arbitrary actors.</li>
+  <li>The audit signing key lives on the box at mode 0600; script hooks run as the invoking user and can read it. External-key custody is planned for v1.1.</li>
+  <li>Credentials added to the agent after the request are not covered by that handover — re-request after inventory changes.</li>
+</ul>
+
+<h2>Source</h2>
+<p>Apache 2.0. <a href="https://github.com/TamTunnel/successor">github.com/TamTunnel/successor</a> — full README, architecture, format spec, and adapter contracts.</p>
+</body>
+</html>
